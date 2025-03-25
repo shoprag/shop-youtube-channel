@@ -1,6 +1,6 @@
 {
     "name": "@shoprag/shop-youtube-channel",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "A YouTube channel ShopRAG plugin for fetching videos, thumbnails, transcripts, metadata, or audio",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
