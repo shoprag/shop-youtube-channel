@@ -1,26 +1,61 @@
 import { Shop, JsonObject } from '@shoprag/core';
-import { google } from 'googleapis';
+import { google, youtube_v3 } from 'googleapis';
 import { YoutubeTranscript } from 'youtube-transcript';
 import moment from 'moment';
+import cliProgress from 'cli-progress';
+
+/**
+ * Configuration interface for the YouTubeChannelShop.
+ */
+interface Config {
+    channelId: string;
+    mode?: string;
+    noDelete?: boolean;
+    titleIncludes?: string;
+    durationMoreThan?: string;
+    durationLessThan?: string;
+    dropAfter?: string;
+    startDate?: string;
+    includeHeader?: boolean; // New option: include header in transcript mode, defaults to true
+}
+
+/**
+ * Interface for filter settings.
+ */
+interface Filters {
+    titleIncludes?: RegExp;
+    durationMoreThan?: number;
+    durationLessThan?: number;
+    dropAfter?: string;
+    startDate?: string;
+}
 
 /**
  * YouTube Channel Shop plugin for ShopRAG.
  * Fetches data from a YouTube channel based on filters and delivers it in one of five modes.
+ * 
+ * **Config options:**
+ * - `channelId`: The ID of the YouTube channel to fetch videos from (required).
+ * - `mode`: Content type to fetch ('metadata', 'thumbnail', 'transcript', 'video', 'audio'). Default: 'metadata'.
+ * - `titleIncludes`: Regex pattern to filter videos by title.
+ * - `durationMoreThan`: Minimum video duration in seconds.
+ * - `durationLessThan`: Maximum video duration in seconds.
+ * - `dropAfter`: Drop videos older than this duration (e.g., '1y' for one year).
+ * - `startDate`: Only include videos published after this date (ISO format).
+ * - `noDelete`: If true, prevents deletion of files even if they no longer match filters. Default: false.
+ * - `includeHeader`: If true, includes a header with metadata in transcript mode. Default: true.
  */
 export default class YouTubeChannelShop implements Shop {
-    private youtube: any; // YouTube API client
-    private channelId: string; // YouTube channel ID
-    private mode: string; // Operation mode
-    private filters: {
-        titleIncludes?: RegExp;
-        durationMoreThan?: number;
-        durationLessThan?: number;
-        dropAfter?: string;
-        startDate?: string;
-    }; // Filter settings
+    private youtube: youtube_v3.Youtube; // Typed YouTube API client
+    private channelId: string;
+    private mode: string;
+    private noDelete: boolean = false;
+    private includeHeader: boolean = true; // Default to true for transcript header
+    private filters: Filters;
 
     /**
      * Defines the credentials required by this Shop.
+     * @returns Object specifying the required YouTube API key and instructions.
      */
     requiredCredentials(): { [credentialName: string]: string } {
         return {
@@ -34,8 +69,8 @@ export default class YouTubeChannelShop implements Shop {
 
     /**
      * Initializes the Shop with credentials and configuration.
-     * @param credentials User-provided credentials.
-     * @param config Configuration from shoprag.json.
+     * @param credentials User-provided credentials containing the YouTube API key.
+     * @param config Configuration object from shoprag.json.
      */
     async init(credentials: { [key: string]: string }, config: JsonObject): Promise<void> {
         const apiKey = credentials['youtube_api_key'];
@@ -46,27 +81,26 @@ export default class YouTubeChannelShop implements Shop {
             version: 'v3',
             auth: apiKey
         });
-        this.channelId = config['channelId'] as string;
+        const cfg = config as unknown as Config;
+        this.channelId = cfg.channelId;
         if (!this.channelId) {
             throw new Error('channelId is required in config.');
         }
-        this.mode = (config['mode'] as string) || 'metadata';
+        this.mode = cfg.mode || 'metadata';
+        this.noDelete = cfg.noDelete === true;
+        this.includeHeader = cfg.includeHeader !== false; // Default to true unless explicitly false
         this.filters = {
-            titleIncludes: config['titleIncludes'] ? new RegExp(config['titleIncludes'] as string) : undefined,
-            durationMoreThan: config['durationMoreThan']
-                ? parseInt(config['durationMoreThan'] as string, 10)
-                : undefined,
-            durationLessThan: config['durationLessThan']
-                ? parseInt(config['durationLessThan'] as string, 10)
-                : undefined,
-            dropAfter: config['dropAfter'] as string,
-            startDate: config['startDate'] as string
+            titleIncludes: cfg.titleIncludes ? new RegExp(cfg.titleIncludes) : undefined,
+            durationMoreThan: cfg.durationMoreThan ? parseInt(cfg.durationMoreThan, 10) : undefined,
+            durationLessThan: cfg.durationLessThan ? parseInt(cfg.durationLessThan, 10) : undefined,
+            dropAfter: cfg.dropAfter,
+            startDate: cfg.startDate
         };
     }
 
     /**
-     * Fetches all video IDs from the channel.
-     * @returns Array of video IDs.
+     * Fetches all video IDs from the channel using pagination.
+     * @returns Promise resolving to an array of video IDs.
      */
     private async getChannelVideoIds(): Promise<string[]> {
         let videoIds: string[] = [];
@@ -79,63 +113,63 @@ export default class YouTubeChannelShop implements Shop {
                 pageToken: nextPageToken,
                 type: ['video']
             });
-            videoIds.push(...response.data.items.map((item: any) => item.id.videoId));
+            const items = response.data.items as youtube_v3.Schema$SearchResult[];
+            videoIds.push(...items.map(item => item.id?.videoId).filter((id): id is string => id !== undefined));
             nextPageToken = response.data.nextPageToken;
         } while (nextPageToken);
         return videoIds;
     }
 
     /**
-     * Fetches detailed video information in batches.
-     * @returns Array of video details.
+     * Fetches detailed video information in batches with a progress bar.
+     * @returns Promise resolving to an array of video details.
      */
-    private async getAllVideoDetails(): Promise<any[]> {
+    private async getAllVideoDetails(): Promise<youtube_v3.Schema$Video[]> {
         const videoIds = await this.getChannelVideoIds();
-        const details: any[] = [];
-        for (let i = 0; i < videoIds.length; i += 50) {
-            const batch = videoIds.slice(i, i + 50);
+        const details: youtube_v3.Schema$Video[] = [];
+        const batchSize = 50;
+        const numBatches = Math.ceil(videoIds.length / batchSize);
+
+        const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
+        progressBar.start(numBatches, 0);
+
+        for (let i = 0; i < videoIds.length; i += batchSize) {
+            const batch = videoIds.slice(i, i + batchSize);
             const response = await this.youtube.videos.list({
                 part: ['contentDetails', 'snippet'],
                 id: batch.join(',')
-            });
-            details.push(...response.data.items);
+            } as any);
+            const items = response.data.items as youtube_v3.Schema$Video[];
+            details.push(...items);
+            progressBar.increment();
         }
+        progressBar.stop();
         return details;
     }
 
     /**
-     * Applies filters to the video list.
-     * @param videos List of video details.
-     * @returns Filtered list of videos.
+     * Applies configured filters to the video list.
+     * @param videos Array of video details.
+     * @returns Filtered array of videos matching all criteria.
      */
-    private applyFilters(videos: any[]): any[] {
+    private applyFilters(videos: youtube_v3.Schema$Video[]): youtube_v3.Schema$Video[] {
         return videos.filter((video) => {
-            const title = video.snippet.title;
-            const publishedAt = new Date(video.snippet.publishedAt);
-            const duration = this.parseDuration(video.contentDetails.duration);
+            const title = video.snippet?.title;
+            const publishedAt = video.snippet?.publishedAt ? new Date(video.snippet.publishedAt) : undefined;
+            const duration = video.contentDetails?.duration ? this.parseDuration(video.contentDetails.duration) : 0;
 
-            if (this.filters.titleIncludes && !this.filters.titleIncludes.test(title)) {
-                return false;
-            }
-            if (this.filters.startDate && publishedAt < new Date(this.filters.startDate)) {
-                return false;
-            }
-            if (this.filters.durationMoreThan && duration < this.filters.durationMoreThan) {
-                return false;
-            }
-            if (this.filters.durationLessThan && duration > this.filters.durationLessThan) {
-                return false;
-            }
-            if (this.filters.dropAfter && this.shouldDropVideo(video.snippet.publishedAt)) {
-                return false;
-            }
+            if (this.filters.titleIncludes && title && !this.filters.titleIncludes.test(title)) return false;
+            if (this.filters.startDate && publishedAt && publishedAt < new Date(this.filters.startDate)) return false;
+            if (this.filters.durationMoreThan && duration < this.filters.durationMoreThan) return false;
+            if (this.filters.durationLessThan && duration > this.filters.durationLessThan) return false;
+            if (this.filters.dropAfter && publishedAt && this.shouldDropVideo(publishedAt)) return false;
             return true;
         });
     }
 
     /**
-     * Parses ISO 8601 duration (e.g., PT1H2M3S) to seconds.
-     * @param duration Duration string.
+     * Parses ISO 8601 duration (e.g., PT1H2M3S) into seconds.
+     * @param duration Duration string from YouTube API.
      * @returns Duration in seconds.
      */
     private parseDuration(duration: string): number {
@@ -148,11 +182,11 @@ export default class YouTubeChannelShop implements Shop {
     }
 
     /**
-     * Determines if a video should be dropped based on age.
-     * @param publishedAt Publication date string.
-     * @returns True if video exceeds dropAfter duration.
+     * Determines if a video exceeds the dropAfter duration based on its publication date.
+     * @param publishedAt Video publication date.
+     * @returns True if the video should be dropped.
      */
-    private shouldDropVideo(publishedAt: string): boolean {
+    private shouldDropVideo(publishedAt: Date): boolean {
         if (!this.filters.dropAfter) return false;
         const age = moment.duration(moment().diff(moment(publishedAt)));
         const dropDuration = this.parseDropAfter(this.filters.dropAfter);
@@ -160,54 +194,60 @@ export default class YouTubeChannelShop implements Shop {
     }
 
     /**
-     * Parses dropAfter duration (e.g., "1y") to milliseconds.
-     * @param dropAfter Duration string.
+     * Converts dropAfter duration (e.g., "1y") into milliseconds.
+     * @param dropAfter Duration string (e.g., "1d", "2w", "3m", "1y").
      * @returns Duration in milliseconds.
      */
     private parseDropAfter(dropAfter: string): number {
         const unit = dropAfter.slice(-1);
         const value = parseInt(dropAfter.slice(0, -1), 10);
         switch (unit) {
-            case 'd':
-                return value * 24 * 60 * 60 * 1000; // days
-            case 'w':
-                return value * 7 * 24 * 60 * 60 * 1000; // weeks
-            case 'm':
-                return value * 30 * 24 * 60 * 60 * 1000; // months (approx)
-            case 'y':
-                return value * 365 * 24 * 60 * 60 * 1000; // years (approx)
-            default:
-                throw new Error(`Invalid dropAfter unit: ${unit}`);
+            case 'd': return value * 24 * 60 * 60 * 1000; // days
+            case 'w': return value * 7 * 24 * 60 * 60 * 1000; // weeks
+            case 'm': return value * 30 * 24 * 60 * 60 * 1000; // months (approx)
+            case 'y': return value * 365 * 24 * 60 * 60 * 1000; // years (approx)
+            default: throw new Error(`Invalid dropAfter unit: ${unit}`);
         }
     }
 
     /**
-     * Fetches metadata content for a video.
-     * @param video Video details.
-     * @returns JSON string of metadata.
+     * Generates metadata content for a video.
+     * @param video Video details object.
+     * @returns JSON string of the video's snippet.
      */
-    private async getMetadataContent(video: any): Promise<string> {
+    private async getMetadataContent(video: youtube_v3.Schema$Video): Promise<string> {
         return JSON.stringify(video.snippet);
     }
 
     /**
-     * Fetches thumbnail URL for a video.
-     * @param video Video details.
-     * @returns Thumbnail URL.
+     * Retrieves the high-resolution thumbnail URL for a video.
+     * @param video Video details object.
+     * @returns Thumbnail URL string or empty string if unavailable.
      */
-    private getThumbnailContent(video: any): string {
-        return video.snippet.thumbnails.high.url;
+    private getThumbnailContent(video: youtube_v3.Schema$Video): string {
+        return video.snippet?.thumbnails?.high?.url || '';
     }
 
     /**
-     * Fetches transcript for a video.
-     * @param videoId Video ID.
-     * @returns Transcript text or error message.
+     * Fetches the transcript for a video, optionally including a header.
+     * @param video Video details object.
+     * @returns Transcript text with optional header or an error message if unavailable.
      */
-    private async getTranscriptContent(videoId: string): Promise<string> {
+    private async getTranscriptContent(video: youtube_v3.Schema$Video): Promise<string> {
+        const videoId = video.id!;
         try {
             const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-            return transcript.map((t: any) => t.text).join(' ');
+            const transcriptText = transcript.map((t: { text: string }) => t.text).join(' ');
+            if (this.includeHeader) {
+                const title = video.snippet?.title || 'Unknown Title';
+                const channelName = video.snippet?.channelTitle || 'Unknown Channel';
+                const dateUploaded = video.snippet?.publishedAt
+                    ? new Date(video.snippet.publishedAt).toISOString()
+                    : 'Unknown Date';
+                return `YouTube video: ${title}\nUploaded by: ${channelName}\nDate: ${dateUploaded}\nVideo transcript follows:\n${transcriptText}\n[end of video]`;
+            } else {
+                return transcriptText;
+            }
         } catch (error) {
             console.error(`Failed to fetch transcript for ${videoId}:`, error);
             return 'Transcript not available';
@@ -215,28 +255,28 @@ export default class YouTubeChannelShop implements Shop {
     }
 
     /**
-     * Provides video URL.
+     * Provides the YouTube video URL.
      * @param videoId Video ID.
-     * @returns YouTube video URL.
+     * @returns Video URL string.
      */
     private getVideoContent(videoId: string): string {
         return `https://www.youtube.com/watch?v=${videoId}`;
     }
 
     /**
-     * Placeholder for audio content (not implemented).
+     * Placeholder for audio content extraction (not implemented).
      * @param videoId Video ID.
      * @returns Placeholder message.
      */
     private getAudioContent(videoId: string): string {
-        return 'Audio extraction not implemented';
+        return 'Audio extraction not yet implemented';
     }
 
     /**
-     * Generates updates by comparing current videos with existing files.
-     * @param lastUsed Last run timestamp.
-     * @param existingFiles Files previously contributed by this Shop.
-     * @returns Dictionary of file updates.
+     * Generates updates by comparing current channel videos with existing files.
+     * @param lastUsed Timestamp of the last run (currently unused).
+     * @param existingFiles Dictionary of existing file IDs and their timestamps.
+     * @returns Dictionary of updates with actions ('add' or 'delete') and content.
      */
     async update(
         lastUsed: number,
@@ -245,45 +285,54 @@ export default class YouTubeChannelShop implements Shop {
         try {
             const videos = await this.getAllVideoDetails();
             const filteredVideos = this.applyFilters(videos);
+
             const updates: { [fileId: string]: { action: 'add' | 'update' | 'delete'; content?: string } } = {};
             const currentFileIds = new Set<string>();
+            const newVideos: youtube_v3.Schema$Video[] = [];
 
-            // Process current videos
             for (const video of filteredVideos) {
                 const fileId = `youtube-channel-${this.channelId}-${video.id}-${this.mode}`;
                 currentFileIds.add(fileId);
-
                 if (!(fileId in existingFiles)) {
-                    let content: string;
-                    switch (this.mode) {
-                        case 'metadata':
-                            content = await this.getMetadataContent(video);
-                            break;
-                        case 'thumbnail':
-                            content = this.getThumbnailContent(video);
-                            break;
-                        case 'transcript':
-                            content = await this.getTranscriptContent(video.id);
-                            break;
-                        case 'video':
-                            content = this.getVideoContent(video.id);
-                            break;
-                        case 'audio':
-                            content = this.getAudioContent(video.id);
-                            break;
-                        default:
-                            throw new Error(`Invalid mode: ${this.mode}`);
-                    }
-                    updates[fileId] = { action: 'add', content };
+                    newVideos.push(video);
                 }
-                // Note: YouTube videos don't typically "update" after publishing,
-                // so we only add new videos and delete old ones.
             }
 
-            // Detect deletions
-            for (const fileId in existingFiles) {
-                if (!currentFileIds.has(fileId)) {
-                    updates[fileId] = { action: 'delete' };
+            const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
+            progressBar.start(newVideos.length, 0);
+
+            for (const video of newVideos) {
+                const fileId = `youtube-channel-${this.channelId}-${video.id}-${this.mode}`;
+                let content: string;
+                switch (this.mode) {
+                    case 'metadata':
+                        content = await this.getMetadataContent(video);
+                        break;
+                    case 'thumbnail':
+                        content = this.getThumbnailContent(video);
+                        break;
+                    case 'transcript':
+                        content = await this.getTranscriptContent(video);
+                        break;
+                    case 'video':
+                        content = this.getVideoContent(video.id!);
+                        break;
+                    case 'audio':
+                        content = this.getAudioContent(video.id!);
+                        break;
+                    default:
+                        throw new Error(`Invalid mode: ${this.mode}`);
+                }
+                updates[fileId] = { action: 'add', content };
+                progressBar.increment();
+            }
+            progressBar.stop();
+
+            if (!this.noDelete) {
+                for (const fileId in existingFiles) {
+                    if (!currentFileIds.has(fileId)) {
+                        updates[fileId] = { action: 'delete' };
+                    }
                 }
             }
 
