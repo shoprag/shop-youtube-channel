@@ -241,10 +241,11 @@ export default class YouTubeChannelShop implements Shop {
             if (this.includeHeader) {
                 const title = video.snippet?.title || 'Unknown Title';
                 const channelName = video.snippet?.channelTitle || 'Unknown Channel';
+                const videoUrl = `https://www.youtube.com/watch?v=${videoId}` || 'Unavailable';
                 const dateUploaded = video.snippet?.publishedAt
                     ? new Date(video.snippet.publishedAt).toISOString()
                     : 'Unknown Date';
-                return `YouTube video: ${title}\nUploaded by: ${channelName}\nDate: ${dateUploaded}\nVideo transcript follows:\n${transcriptText}\n[end of video]`;
+                return `YouTube video: ${title}\nVideo URL: ${videoUrl}\nUploaded by: ${channelName}\nDate: ${dateUploaded}\nVideo transcript follows:\n${transcriptText}\n[end of video]`;
             } else {
                 return transcriptText;
             }
